@@ -6,14 +6,20 @@ import asyncio
 import time
 
 st.set_page_config(page_title="Crypto Scanner أسرع نسخة 🔥", layout="wide")
-st.title("Crypto Scanner بالعربي 🔍 - أسرع نسخة للسوق كله")
+st.title("Crypto Scanner بالعربي 🔍 - النسخة النهائية للسوق كله")
 
 # -----------------------------
 # جلب كل العملات من CoinGecko
 # -----------------------------
 async def fetch_page(session, page):
     url = "https://api.coingecko.com/api/v3/coins/markets"
-    params = {"vs_currency":"usd","order":"market_cap_desc","per_page":250,"page":page,"sparkline":False}
+    params = {
+        "vs_currency": "usd",
+        "order": "market_cap_desc",
+        "per_page": str(250),
+        "page": str(page),
+        "sparkline": "false"
+    }
     async with session.get(url, params=params) as resp:
         return await resp.json()
 
@@ -21,7 +27,7 @@ async def get_market_data_all():
     all_data = []
     async with aiohttp.ClientSession() as session:
         tasks = []
-        for page in range(1, 21):  # تقريبًا يغطي ~5000 عملة (250 لكل صفحة × 20 صفحة)
+        for page in range(1, 21):  # يغطي ~5000 عملة
             tasks.append(fetch_page(session, page))
         pages = await asyncio.gather(*tasks)
         for page_data in pages:
