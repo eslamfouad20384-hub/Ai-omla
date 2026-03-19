@@ -1,36 +1,52 @@
-# crypto_scanner_best_version.py
 import streamlit as st
 import pandas as pd
-import requests
 import numpy as np
+import aiohttp
+import asyncio
+import time
 
-st.set_page_config(page_title="أفضل Crypto Scanner 🔥", layout="wide")
-st.title("أفضل Crypto Scanner بالعربي 🔍")
+st.set_page_config(page_title="Crypto Scanner أسرع نسخة 🔥", layout="wide")
+st.title("Crypto Scanner بالعربي 🔍 - أسرع نسخة للسوق كله")
 
 # -----------------------------
-# 1️⃣ جلب بيانات السوق
+# جلب كل العملات من CoinGecko
 # -----------------------------
-def get_market_data():
+async def fetch_page(session, page):
     url = "https://api.coingecko.com/api/v3/coins/markets"
-    params = {"vs_currency":"usd","order":"market_cap_desc","per_page":100,"page":1,"sparkline":False}
-    response = requests.get(url, params=params)
-    df = pd.DataFrame(response.json())
-    return df
+    params = {"vs_currency":"usd","order":"market_cap_desc","per_page":250,"page":page,"sparkline":False}
+    async with session.get(url, params=params) as resp:
+        return await resp.json()
+
+async def get_market_data_all():
+    all_data = []
+    async with aiohttp.ClientSession() as session:
+        tasks = []
+        for page in range(1, 21):  # تقريبًا يغطي ~5000 عملة (250 لكل صفحة × 20 صفحة)
+            tasks.append(fetch_page(session, page))
+        pages = await asyncio.gather(*tasks)
+        for page_data in pages:
+            if not page_data:
+                continue
+            all_data.extend(page_data)
+    return pd.DataFrame(all_data)
 
 # -----------------------------
-# 2️⃣ جلب بيانات OHLC
+# جلب بيانات OHLC لكل عملة
 # -----------------------------
-def get_historical_data(coin_id, days=30):
+async def fetch_ohlc(session, coin_id):
     url = f"https://api.coingecko.com/api/v3/coins/{coin_id}/market_chart"
-    params = {"vs_currency":"usd","days":days,"interval":"daily"}
-    response = requests.get(url, params=params)
-    data = response.json()
-    df = pd.DataFrame(data['prices'], columns=['timestamp', 'close'])
-    df['close'] = df['close'].astype(float)
-    return df
+    params = {"vs_currency":"usd","days":30,"interval":"daily"}
+    try:
+        async with session.get(url, params=params) as resp:
+            data = await resp.json()
+            df = pd.DataFrame(data['prices'], columns=['timestamp','close'])
+            df['close'] = df['close'].astype(float)
+            return df
+    except:
+        return None
 
 # -----------------------------
-# 3️⃣ حساب RSI
+# حساب RSI
 # -----------------------------
 def calculate_RSI(df, period=14):
     delta = df['close'].diff()
@@ -43,84 +59,69 @@ def calculate_RSI(df, period=14):
     return rsi.iloc[-1]
 
 # -----------------------------
-# 4️⃣ حساب الدعم
+# حساب الدعم
 # -----------------------------
 def calculate_support(df, period=14):
     return df['close'].tail(period).min()
 
 # -----------------------------
-# 5️⃣ فلترة العملات
+# معالجة كل العملات بالتوازي
 # -----------------------------
-def filter_coins(df_market):
+async def process_coin(session, row):
+    coin_id = row['id']
+    hist = await fetch_ohlc(session, coin_id)
+    if hist is None or hist.empty:
+        return None
+
+    rsi = calculate_RSI(hist)
+    support = calculate_support(hist)
+    volume_today = hist['close'].iloc[-1]
+    volume_prev = hist['close'].iloc[-2] if len(hist)>1 else hist['close'].iloc[-1]
+    volume_increasing = volume_today > volume_prev
+
+    liquidity_ok = row['total_volume'] >= 5000000
+    volume_ok = volume_increasing
+    buy_volume = row['total_volume']*0.6
+    sell_volume = row['total_volume']*0.4
+    buy_vs_sell_ok = buy_volume > sell_volume
+    rsi_ok = rsi < 30
+    support_ok = row['current_price'] <= support
+
+    return {
+        'الاسم / Name': row['name'],
+        'رمز العملة / Symbol': row['symbol'],
+        'السعر / Price (USD)': row['current_price'],
+        'السيولة / Liquidity': row['total_volume'],
+        'حجم الشراء / Buy Volume': buy_volume,
+        'حجم البيع / Sell Volume': sell_volume,
+        'RSI': rsi,
+        'الدعم / Support': support,
+        'Liquidity_OK': liquidity_ok,
+        'Volume_OK': volume_ok,
+        'Buy_vs_Sell_OK': buy_vs_sell_ok,
+        'RSI_OK': rsi_ok,
+        'Support_OK': support_ok
+    }
+
+async def process_all_coins(df_market):
     results = []
-
-    for _, row in df_market.iterrows():
-        coin_id = row['id']
-        try:
-            hist = get_historical_data(coin_id, days=30)
-            rsi = calculate_RSI(hist)
-            support = calculate_support(hist)
-            # مقارنة الفوليوم اليوم بالأيام السابقة
-            volume_today = hist['close'].iloc[-1]
-            volume_prev = hist['close'].iloc[-2] if len(hist) > 1 else hist['close'].iloc[-1]
-            volume_increasing = volume_today > volume_prev
-        except:
-            rsi = None
-            support = None
-            volume_increasing = False
-
-        liquidity_ok = row['total_volume'] >= 5000000
-        volume_ok = volume_increasing
-        buy_volume = row['total_volume']*0.6  # تقدير إذا مصدر Buy/Sell مش متاح
-        sell_volume = row['total_volume']*0.4
-        buy_vs_sell_ok = buy_volume > sell_volume
-        rsi_ok = rsi is not None and rsi < 30
-        support_ok = row['current_price'] <= support if support else False
-
-        results.append({
-            'الاسم / Name': row['name'],
-            'رمز العملة / Symbol': row['symbol'],
-            'السعر / Price (USD)': row['current_price'],
-            'السيولة / Liquidity': row['total_volume'],
-            'حجم الشراء / Buy Volume': buy_volume,
-            'حجم البيع / Sell Volume': sell_volume,
-            'RSI': rsi,
-            'الدعم / Support': support,
-            'Liquidity_OK': liquidity_ok,
-            'Volume_OK': volume_ok,
-            'Buy_vs_Sell_OK': buy_vs_sell_ok,
-            'RSI_OK': rsi_ok,
-            'Support_OK': support_ok
-        })
-
+    async with aiohttp.ClientSession() as session:
+        tasks = [process_coin(session, row) for _, row in df_market.iterrows()]
+        all_results = await asyncio.gather(*tasks)
+        for res in all_results:
+            if res:
+                results.append(res)
     return pd.DataFrame(results)
 
 # -----------------------------
-# 6️⃣ واجهة Streamlit
+# واجهة Streamlit
 # -----------------------------
-st.markdown("### اضغط زر تحديث لجلب البيانات وحساب كل الشروط الحقيقية")
+st.markdown("### اضغط زر تحديث لجلب بيانات السوق كله وحساب كل الشروط بدقة")
 if st.button("تحديث البيانات / Refresh Data"):
-    df_market = get_market_data()
-    filtered = filter_coins(df_market)
+    st.info("جاري جلب بيانات السوق وحساب RSI لكل عملة... قد يستغرق دقيقة أو أكثر حسب عدد العملات")
+    start_time = time.time()
+    df_market = asyncio.run(get_market_data_all())
+    filtered = asyncio.run(process_all_coins(df_market))
     st.subheader(f"عدد العملات اللي استوفت كل الشروط: {len(filtered)}")
     st.dataframe(filtered)
-
-# -----------------------------
-# 7️⃣ شرح الأعمدة
-# -----------------------------
-st.markdown("""
-**شرح الأعمدة:**
-- الاسم / Name: اسم العملة
-- رمز العملة / Symbol: اختصار العملة
-- السعر / Price (USD): السعر الحالي بالدولار
-- السيولة / Liquidity: حجم التداول الحالي
-- حجم الشراء / Buy Volume: حجم الشراء
-- حجم البيع / Sell Volume: حجم البيع
-- RSI: مؤشر القوة النسبية الحقيقي
-- الدعم / Support: سعر الدعم الحقيقي
-- Liquidity_OK: هل السيولة ≥ 5 مليون
-- Volume_OK: هل الفوليوم بيزيد فعليًا
-- Buy_vs_Sell_OK: هل الشراء أعلى من البيع
-- RSI_OK: هل RSI < 30
-- Support_OK: هل السعر عند الدعم
-""")
+    st.success(f"تم التحديث في {time.time()-start_time:.2f} ثانية")
