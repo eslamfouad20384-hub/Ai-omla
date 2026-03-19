@@ -5,111 +5,103 @@ import aiohttp
 import asyncio
 import time
 
-st.set_page_config(page_title="Crypto Scanner أسرع نسخة 🔥", layout="wide")
-st.title("Crypto Scanner بالعربي 🔍 - النسخة النهائية للسوق كله")
+st.set_page_config(layout="wide")
+st.title("Crypto Scanner بالعربي 🔍 - النسخة النهائية مع CryptoCompare")
 
-# -----------------------------
-# جلب كل العملات من CoinGecko
-# -----------------------------
-async def fetch_page(session, page):
+# ==============================
+# إعدادات
+# ==============================
+MIN_LIQUIDITY = 5_000_000
+RSI_THRESHOLD = 30
+TOP_LIMIT = 300
+
+# ==============================
+# جلب قائمة العملات من CoinGecko (رموز العملات فقط)
+# ==============================
+async def fetch_market_list():
     url = "https://api.coingecko.com/api/v3/coins/markets"
-    params = {
-        "vs_currency": "usd",
-        "order": "market_cap_desc",
-        "per_page": "250",
-        "page": str(page),
-        "sparkline": "false"
-    }
-    async with session.get(url, params=params) as resp:
-        return await resp.json()
-
-async def get_market_data_all():
-    all_data = []
     async with aiohttp.ClientSession() as session:
-        tasks = [fetch_page(session, page) for page in range(1, 21)]  # يغطي ~5000 عملة
-        pages = await asyncio.gather(*tasks)
-        for page_data in pages:
-            if not page_data:
-                continue
-            all_data.extend(page_data)
-    df = pd.DataFrame(all_data)
-    # نتجاهل أي صف بدون 'id'
-    df = df.dropna(subset=['id'])
-    return df
-
-# -----------------------------
-# جلب بيانات OHLC لكل عملة
-# -----------------------------
-async def fetch_ohlc(session, coin_id):
-    url = f"https://api.coingecko.com/api/v3/coins/{coin_id}/market_chart"
-    params = {"vs_currency":"usd","days":30,"interval":"daily"}
-    try:
+        params = {
+            "vs_currency": "usd",
+            "order": "market_cap_desc",
+            "per_page": "250",
+            "page": "1",
+            "sparkline": "false"
+        }
         async with session.get(url, params=params) as resp:
             data = await resp.json()
-            df = pd.DataFrame(data['prices'], columns=['timestamp','close'])
-            df['close'] = df['close'].astype(float)
+            df = pd.DataFrame(data)
+            df = df.dropna(subset=["symbol"])
+            return df
+
+# ==============================
+# جلب OHLC من CryptoCompare
+# ==============================
+async def fetch_ohlc(session, symbol):
+    url = f"https://min-api.cryptocompare.com/data/v2/histohour"
+    params = {"fsym": symbol.upper(), "tsym": "USDT", "limit": 200}
+    try:
+        async with session.get(url, params=params) as resp:
+            r = await resp.json()
+            df = pd.DataFrame(r["Data"]["Data"])
+            if df.empty or "close" not in df.columns:
+                return None
             return df
     except:
         return None
 
-# -----------------------------
-# حساب RSI
-# -----------------------------
-def calculate_RSI(df, period=14):
-    delta = df['close'].diff()
+# ==============================
+# حساب المؤشرات
+# ==============================
+def add_indicators(df):
+    df["ema50"] = df["close"].ewm(span=50).mean()
+    df["ema200"] = df["close"].ewm(span=200).mean()
+    delta = df["close"].diff()
     gain = delta.clip(lower=0)
-    loss = -1*delta.clip(upper=0)
-    avg_gain = gain.rolling(period).mean()
-    avg_loss = loss.rolling(period).mean()
+    loss = -delta.clip(upper=0)
+    avg_gain = gain.rolling(14).mean()
+    avg_loss = loss.rolling(14).mean()
     rs = avg_gain / avg_loss
-    rsi = 100 - (100 / (1 + rs))
-    return rsi.iloc[-1]
+    df["rsi"] = 100 - (100 / (1 + rs))
+    return df
 
-# -----------------------------
+# ==============================
 # حساب الدعم
-# -----------------------------
+# ==============================
 def calculate_support(df, period=14):
-    return df['close'].tail(period).min()
+    return df["close"].tail(period).min()
 
-# -----------------------------
-# معالجة كل العملات بالتوازي
-# -----------------------------
+# ==============================
+# فلترة كل العملات حسب الشروط
+# ==============================
 async def process_coin(session, row):
     try:
-        coin_id = row['id']
-        hist = await fetch_ohlc(session, coin_id)
-        if hist is None or hist.empty:
+        symbol = row["symbol"]
+        ohlc = await fetch_ohlc(session, symbol)
+        if ohlc is None or len(ohlc) < 14:
             return None
 
-        rsi = calculate_RSI(hist)
-        support = calculate_support(hist)
-        volume_today = hist['close'].iloc[-1]
-        volume_prev = hist['close'].iloc[-2] if len(hist)>1 else hist['close'].iloc[-1]
-        volume_increasing = volume_today > volume_prev
+        ohlc = add_indicators(ohlc)
+        rsi = ohlc["rsi"].iloc[-1]
+        support = calculate_support(ohlc)
 
-        liquidity_ok = row.get('total_volume',0) >= 5000000
-        volume_ok = volume_increasing
-        buy_volume = row.get('total_volume',0)*0.6
-        sell_volume = row.get('total_volume',0)*0.4
+        liquidity_ok = row.get("total_volume",0) >= MIN_LIQUIDITY
+        buy_volume = row.get("total_volume",0) * 0.6
+        sell_volume = row.get("total_volume",0) * 0.4
         buy_vs_sell_ok = buy_volume > sell_volume
-        rsi_ok = rsi < 30
-        support_ok = row.get('current_price',0) <= support
+        rsi_ok = rsi < RSI_THRESHOLD
+        support_ok = row.get("current_price",0) <= support
 
-        return {
-            'الاسم / Name': row.get('name','N/A'),
-            'رمز العملة / Symbol': row.get('symbol','N/A'),
-            'السعر / Price (USD)': row.get('current_price',0),
-            'السيولة / Liquidity': row.get('total_volume',0),
-            'حجم الشراء / Buy Volume': buy_volume,
-            'حجم البيع / Sell Volume': sell_volume,
-            'RSI': rsi,
-            'الدعم / Support': support,
-            'Liquidity_OK': liquidity_ok,
-            'Volume_OK': volume_ok,
-            'Buy_vs_Sell_OK': buy_vs_sell_ok,
-            'RSI_OK': rsi_ok,
-            'Support_OK': support_ok
-        }
+        if all([liquidity_ok, buy_vs_sell_ok, rsi_ok, support_ok]):
+            return {
+                "Name": row.get("name","N/A"),
+                "Symbol": symbol.upper(),
+                "Price": row.get("current_price",0),
+                "Liquidity": row.get("total_volume",0),
+                "RSI": rsi,
+                "Support": support,
+            }
+        return None
     except:
         return None
 
@@ -123,14 +115,13 @@ async def process_all_coins(df_market):
                 results.append(res)
     return pd.DataFrame(results)
 
-# -----------------------------
+# ==============================
 # واجهة Streamlit
-# -----------------------------
-st.markdown("### اضغط زر تحديث لجلب بيانات السوق كله وحساب كل الشروط بدقة")
+# ==============================
 if st.button("تحديث البيانات / Refresh Data"):
-    st.info("جاري جلب بيانات السوق وحساب RSI لكل عملة... قد يستغرق دقيقة أو أكثر حسب عدد العملات")
+    st.info("جاري جلب بيانات السوق وحساب كل الشروط بدقة... قد يستغرق دقيقة أو أكثر")
     start_time = time.time()
-    df_market = asyncio.run(get_market_data_all())
+    df_market = asyncio.run(fetch_market_list())
     filtered = asyncio.run(process_all_coins(df_market))
     st.subheader(f"عدد العملات اللي استوفت كل الشروط: {len(filtered)}")
     st.dataframe(filtered)
